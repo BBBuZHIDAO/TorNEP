@@ -16,22 +16,25 @@ import torch.nn as nn
 import numpy as np
 from typing import List, Tuple, Dict, Optional
 
-# --- robust import for spherical_harmonics ---
 try:
-    # package usage: import model.nep3_model
     from .spherical_harmonics import (
         SphericalHarmonicsNEP,
+        accumulate_s_edges_batched,
+        find_q_batched,
         accumulate_s,
         find_q,
         NUM_OF_ABC,
     )
-except Exception:
-    try:
-        # standalone: python model/nep3_model.py (cwd=model)
-        from spherical_harmonics import SphericalHarmonicsNEP, accumulate_s, find_q, NUM_OF_ABC
-    except Exception:
-        # repo-root: python -c "import model.nep3_model"
-        from model.spherical_harmonics import SphericalHarmonicsNEP, accumulate_s, find_q, NUM_OF_ABC
+except Exception:  # standalone usage
+    from spherical_harmonics import (
+        SphericalHarmonicsNEP,
+        accumulate_s_edges_batched,
+        find_q_batched,
+        accumulate_s,
+        find_q,
+        NUM_OF_ABC,
+    )
+
 
 class ChebyshevBasis(nn.Module):
     """
@@ -264,6 +267,123 @@ class NEP3Model(nn.Module):
 
     # --------------------------- descriptors ---------------------------
 
+    def _neighbors_edges(
+        self,
+        positions: torch.Tensor,
+        cell: Optional[torch.Tensor],
+        cutoff: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return neighbor edges as (edge_i, edge_j, rij)."""
+        if self.neighbor_backend.lower() in ("gpumd", "torch"):
+            return self.build_neighbor_edges_torch(positions, cell, cutoff)
+        return self.build_neighbor_edges_ase(positions, cell, cutoff)
+
+    def build_neighbor_edges_ase(
+        self,
+        positions: torch.Tensor,
+        cell: Optional[torch.Tensor],
+        cutoff: float,
+        pbc: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Use ASE to obtain (i, j, S) within cutoff, then build rij with torch positions:
+            rij = r_j + S0*a + S1*b + S2*c - r_i
+
+        Returns:
+            edge_i: (E,) long
+            edge_j: (E,) long
+            rij:    (E, 3) float (same dtype/device as positions)
+
+        Notes:
+        - ASE is only used to generate the neighbor *indices*; the geometry expression uses torch tensors,
+          so gradients wrt positions are preserved.
+        """
+        if cell is None:
+            return self.build_neighbor_edges_torch(positions, None, cutoff)
+
+        try:
+            from ase import Atoms
+            from ase.neighborlist import neighbor_list
+            import numpy as _np
+
+            n_atoms = int(positions.shape[0])
+            pos_np = positions.detach().cpu().numpy()
+            cell_np = cell.detach().cpu().numpy()
+            numbers = _np.ones(n_atoms, dtype=int)
+
+            atoms = Atoms(numbers=numbers, positions=pos_np, cell=cell_np, pbc=pbc)
+            i_idx, j_idx, S = neighbor_list("ijS", atoms, cutoff)
+
+            if len(i_idx) == 0:
+                edge_i = torch.empty((0,), device=positions.device, dtype=torch.long)
+                edge_j = torch.empty((0,), device=positions.device, dtype=torch.long)
+                rij = torch.empty((0, 3), device=positions.device, dtype=positions.dtype)
+                return edge_i, edge_j, rij
+
+            edge_i = torch.as_tensor(i_idx, device=positions.device, dtype=torch.long)
+            edge_j = torch.as_tensor(j_idx, device=positions.device, dtype=torch.long)
+
+            # shift vectors (integers) -> geometry shift in Cartesian using torch cell
+            S_t = torch.as_tensor(S, device=positions.device, dtype=positions.dtype)  # (E,3)
+            delta = (
+                S_t[:, 0:1] * cell[0] +
+                S_t[:, 1:2] * cell[1] +
+                S_t[:, 2:3] * cell[2]
+            )
+            rij = positions[edge_j] + delta - positions[edge_i]  # (E,3)
+
+            return edge_i, edge_j, rij
+        except Exception:
+            return self.build_neighbor_edges_torch(positions, cell, cutoff)
+
+    def build_neighbor_edges_torch(
+        self,
+        positions: torch.Tensor,
+        cell: Optional[torch.Tensor],
+        cutoff: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Pure torch neighbor build (O(N^2)).
+
+        Returns:
+            edge_i: (E,) long
+            edge_j: (E,) long
+            rij:    (E, 3)
+
+        For PBC, uses MIC with the given 3x3 cell.
+        """
+        n_atoms = int(positions.shape[0])
+        if n_atoms == 0:
+            edge_i = torch.empty((0,), device=positions.device, dtype=torch.long)
+            edge_j = torch.empty((0,), device=positions.device, dtype=torch.long)
+            rij = torch.empty((0, 3), device=positions.device, dtype=positions.dtype)
+            return edge_i, edge_j, rij
+
+        # all pairs i<j
+        idx_i, idx_j = torch.triu_indices(n_atoms, n_atoms, offset=1, device=positions.device)
+        rij_ij = positions[idx_j] - positions[idx_i]  # (P,3)
+
+        if cell is not None:
+            inv_cell = torch.linalg.inv(cell)
+            frac = rij_ij @ inv_cell  # (P,3)
+            frac = frac - torch.round(frac)
+            rij_ij = frac @ cell
+
+        dist = torch.linalg.norm(rij_ij, dim=1)
+        mask = dist < float(cutoff)
+        idx_i = idx_i[mask]
+        idx_j = idx_j[mask]
+        rij_ij = rij_ij[mask]
+
+        # directed edges i->j and j->i
+        edge_i = torch.cat([idx_i, idx_j], dim=0)
+        edge_j = torch.cat([idx_j, idx_i], dim=0)
+        rij = torch.cat([rij_ij, -rij_ij], dim=0)
+
+        return edge_i, edge_j, rij
+
+
+
     def compute_radial_descriptor(
         self,
         positions: torch.Tensor,
@@ -271,7 +391,12 @@ class NEP3Model(nn.Module):
         cell: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Radial descriptor q_radial[i, n] = sum_j g_n(r_ij).
+        Radial descriptor (vectorized over edges):
+
+            q_radial[i, n] = sum_j g_n(r_ij)
+
+        where
+            g_n(r_ij) = sum_k  f_k(r_ij) * c_radial[t_pair, n, k].
         """
         n_atoms = int(positions.shape[0])
         dtype = positions.dtype
@@ -279,25 +404,23 @@ class NEP3Model(nn.Module):
 
         q_radial = torch.zeros((n_atoms, self.n_max_radial + 1), device=device, dtype=dtype)
 
-        neighbors_map = self._neighbors(positions, cell, self.rc_radial)
+        edge_i, edge_j, rij = self._neighbors_edges(positions, cell, self.rc_radial)
+        if edge_i.numel() == 0:
+            return q_radial
 
-        for i in range(n_atoms):
-            t_i = int(atom_types[i].item())
-            for j, rij in neighbors_map.get(i, []):
-                dist = torch.linalg.norm(rij)
-                if dist.item() >= self.rc_radial:
-                    continue
+        dist = torch.linalg.norm(rij, dim=1)  # (E,)
+        basis = self.radial_basis.basis_functions(dist)  # (E, K)
 
-                t_j = int(atom_types[j].item())
-                t_pair = t_i * self.num_types + t_j
+        # type-pair index per edge: t_pair = t_i * num_types + t_j
+        t_pair = atom_types[edge_i] * self.num_types + atom_types[edge_j]  # (E,)
 
-                basis = self.radial_basis.basis_functions(dist)  # (K,)
-                # gn(n) = sum_k fn_k * c[t_pair, n, k]
-                # vectorize over k
-                for n in range(self.n_max_radial + 1):
-                    gn = torch.sum(basis * self.c_radial[t_pair, n, :].to(dtype=dtype))
-                    q_radial[i, n] = q_radial[i, n] + gn
+        # coeff: (E, n, K)
+        coeff = self.c_radial[t_pair].to(dtype=dtype)
+        # g: (E, n)
+        g = torch.einsum("ek,enk->en", basis, coeff)
 
+        # scatter-add to centers
+        q_radial.index_add_(0, edge_i, g)
         return q_radial
 
     def compute_angular_descriptor(
@@ -307,59 +430,63 @@ class NEP3Model(nn.Module):
         cell: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Angular descriptor via GPUMD pipeline:
-          for each i, for each n:
-            s[:] = 0
-            for each neighbor j:
-              gn12 = sum_k fn_k(r_ij) * c[t_pair, n, k]
-              accumulate_s(l_max, r_ij, gn12, s)
-            find_q(l_max, num_L, n_max+1, n, s, q_i, c3b,c4b,c5b)
+        Angular descriptor (fully vectorized over edges and n-channels; only the small L-loop remains).
+
+        Pipeline:
+          1) Build neighbor edge list (edge_i, edge_j, rij) within rc_angular.
+          2) Compute Chebyshev basis on all edges: basis(E,K).
+          3) Compute gn12 on all edges and all n: fn(E,n) via einsum.
+          4) Accumulate real spherical-harmonics components in batch:
+                s(N,n,NUM_OF_ABC) = sum_{edges e with center=edge_i} fn(e,n) * Y_lm(dir_e)
+             using index_add_ (scatter) under the hood.
+          5) Convert s -> q in batch: q(N,num_L,n), then flatten to (N, n*num_L) in GPUMD order.
         """
         n_atoms = int(positions.shape[0])
         dtype = positions.dtype
         device = positions.device
 
-        n_max_angular_plus_1 = self.n_max_angular + 1
-        q_angular = torch.zeros((n_atoms, n_max_angular_plus_1 * self.num_L), device=device, dtype=dtype)
+        n_chan = self.n_max_angular + 1
+        q_angular = torch.zeros((n_atoms, n_chan * self.num_L), device=device, dtype=dtype)
 
-        neighbors_map = self._neighbors(positions, cell, self.rc_angular)
+        edge_i, edge_j, rij = self._neighbors_edges(positions, cell, self.rc_angular)
+        if edge_i.numel() == 0:
+            return q_angular
 
-        for i in range(n_atoms):
-            t_i = int(atom_types[i].item())
-            neighbors_i = neighbors_map.get(i, [])
-            if len(neighbors_i) == 0:
-                continue
+        dist = torch.linalg.norm(rij, dim=1)  # (E,)
 
-            for n in range(n_max_angular_plus_1):
-                s = torch.zeros((NUM_OF_ABC,), device=device, dtype=dtype)
+        # Safety mask (ASE neighbor_list already respects cutoff; torch backend may over-generate)
+        mask = dist < float(self.rc_angular)
+        if mask.sum().item() != dist.numel():
+            edge_i = edge_i[mask]
+            edge_j = edge_j[mask]
+            rij = rij[mask]
+            dist = dist[mask]
 
-                for j, rij in neighbors_i:
-                    dist_j = torch.linalg.norm(rij)
-                    if dist_j.item() >= self.rc_angular:
-                        continue
+        # Chebyshev basis on edges
+        basis = self.angular_basis.basis_functions(dist)  # (E, K)
 
-                    t_j = int(atom_types[j].item())
-                    t_pair = t_i * self.num_types + t_j
+        # pair type per edge: t_pair = t_i * num_types + t_j
+        t_pair = atom_types[edge_i] * self.num_types + atom_types[edge_j]  # (E,)
 
-                    basis_j = self.angular_basis.basis_functions(dist_j)  # (K,)
-                    gn12 = torch.sum(basis_j * self.c_angular_base[t_pair, n, :].to(dtype=dtype))
+        # coefficients per edge: (E, n_chan, K)
+        coeff = self.c_angular_base[t_pair].to(dtype=dtype)
 
-                    accumulate_s(self.l_max, dist_j, rij[0], rij[1], rij[2], gn12, s)
+        # fn per edge and n-channel: (E, n_chan)
+        fn = torch.einsum("ek,enk->en", basis, coeff)
 
-                find_q(
-                    self.l_max,
-                    self.num_L,
-                    n_max_angular_plus_1,
-                    n,
-                    s,
-                    q_angular[i],
-                    self.spherical_harmonics.c3b.to(dtype=dtype),
-                    self.spherical_harmonics.c4b.to(dtype=dtype),
-                    self.spherical_harmonics.c5b.to(dtype=dtype),
-                )
+        # accumulate s (N, n_chan, NUM_OF_ABC)
+        s = accumulate_s_edges_batched(self.l_max, rij, fn, edge_i, n_atoms)
 
-        return q_angular
-
+        # find q (N, num_L, n_chan) and flatten to GPUMD layout: [L blocks][n within block]
+        q_Ln = find_q_batched(
+            self.l_max,
+            self.num_L,
+            s,
+            self.spherical_harmonics.c3b,
+            self.spherical_harmonics.c4b,
+            self.spherical_harmonics.c5b,
+        )
+        return q_Ln.reshape(n_atoms, -1)
     def compute_descriptors(
         self,
         positions: torch.Tensor,
@@ -370,6 +497,41 @@ class NEP3Model(nn.Module):
         q_angular = self.compute_angular_descriptor(positions, atom_types, cell)
         descriptors = torch.cat([q_radial, q_angular], dim=1)
         return descriptors, q_radial, q_angular
+    
+    @torch.no_grad()
+    def dump_descriptors(
+        self,
+        positions: torch.Tensor,
+        atom_types: torch.Tensor,
+        cell: torch.Tensor | None = None,
+        output_descriptor: int = 2,
+        path: str = "descriptor_py.out",
+        fmt: str = "%15.7e",
+    ) -> None:
+        """
+        Match GPUMD nep.cu behavior:
+          - output_descriptor==2: per-atom, one row per atom
+          - output_descriptor==1: per-structure average, one row
+        Values are AFTER q_scaler multiplication (same as GPUMD printing).
+        """
+        self.eval()
+
+        descriptors, _, _ = self.compute_descriptors(positions, atom_types, cell)
+
+        # GPUMD prints scaled descriptors
+        if getattr(self, "q_scaler", None) is not None:
+            descriptors = descriptors * self.q_scaler
+
+        D = descriptors.detach().cpu().numpy()  # (N, dim)
+
+        if output_descriptor == 1:
+            D = D.mean(axis=0, keepdims=True)   # (1, dim)
+        elif output_descriptor == 2:
+            pass
+        else:
+            raise ValueError("output_descriptor must be 1 or 2 (GPUMD-compatible).")
+
+        np.savetxt(path, D, fmt=fmt)
 
     # --------------------------- forward ---------------------------
 

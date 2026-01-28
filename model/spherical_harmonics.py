@@ -123,10 +123,43 @@ TensorLike = Union[torch.Tensor, float, int]
 
 
 def _to_scalar_tensor(x: TensorLike, ref: torch.Tensor) -> torch.Tensor:
-    """Convert x to a 0-dim tensor on ref's device/dtype."""
+    """Convert ``x`` to a 0-dim tensor on ``ref``'s device/dtype (cheap fast-path)."""
     if isinstance(x, torch.Tensor):
+        # Avoid creating new tensors when already aligned.
+        if x.device == ref.device and x.dtype == ref.dtype and x.ndim == 0:
+            return x
         return x.to(device=ref.device, dtype=ref.dtype)
-    return torch.tensor(x, device=ref.device, dtype=ref.dtype)
+    return torch.as_tensor(x, device=ref.device, dtype=ref.dtype)
+
+
+# ---- small caches to avoid repeated .to() on constant tables ----
+_Z_CACHE: dict[tuple[int, str, str], torch.Tensor] = {}
+_MASK_CACHE: dict[tuple[int, str, str], torch.Tensor] = {}
+
+# Precompute parity/limit masks on CPU (float32), then move/cast once per (device, dtype).
+_Z_MASKS_CPU: list[torch.Tensor | None] = [None]
+for _L in range(1, 9):
+    _n1 = torch.arange(0, _L + 1, dtype=torch.int64).view(-1, 1)
+    _n2 = torch.arange(0, _L + 1, dtype=torch.int64).view(1, -1)
+    # allowed n2: n2 <= L-n1 and parity(n2) == parity(L+n1)
+    _mask = (_n2 <= (_L - _n1)) & ((_n2 & 1) == ((_L + _n1) & 1))
+    _Z_MASKS_CPU.append(_mask.to(torch.float32))
+
+def _get_Z_coeff(L: int, ref: torch.Tensor) -> torch.Tensor:
+    key = (int(L), str(ref.device), str(ref.dtype))
+    z = _Z_CACHE.get(key)
+    if z is None:
+        z = Z_COEFFICIENTS[int(L)].to(device=ref.device, dtype=ref.dtype)
+        _Z_CACHE[key] = z
+    return z
+
+def _get_Z_mask(L: int, ref: torch.Tensor) -> torch.Tensor:
+    key = (int(L), str(ref.device), str(ref.dtype))
+    m = _MASK_CACHE.get(key)
+    if m is None:
+        m = _Z_MASKS_CPU[int(L)].to(device=ref.device, dtype=ref.dtype)
+        _MASK_CACHE[key] = m
+    return m
 
 
 def complex_product(a: TensorLike, b: TensorLike, real_part: torch.Tensor, imag_part: torch.Tensor, ref: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -142,16 +175,8 @@ def accumulate_s_one(L: int, x12: TensorLike, y12: TensorLike, z12: TensorLike, 
     """
     Accumulate spherical harmonics for angular momentum L (GPUMD accumulate_s_one).
 
-    Parameters
-    ----------
-    L : int
-        Angular momentum.
-    x12, y12, z12 : TensorLike
-        Normalized direction components.
-    fn : TensorLike
-        Radial prefactor (e.g., g_n(r_ij)).
-    s : torch.Tensor
-        Output array (length NUM_OF_ABC), updated in place.
+    This implementation is vectorized over the internal (n1,n2) summations to reduce
+    Python-level overhead and repeated tensor conversions.
     """
     ref = s
     x12_t = _to_scalar_tensor(x12, ref)
@@ -161,32 +186,32 @@ def accumulate_s_one(L: int, x12: TensorLike, y12: TensorLike, z12: TensorLike, 
 
     s_index = L * L - 1
 
-    # z^n
-    z_pow = [torch.ones((), device=ref.device, dtype=ref.dtype)]
-    for _ in range(1, L + 1):
-        z_pow.append(z12_t * z_pow[-1])
+    # z^n, n=0..L
+    n = torch.arange(0, L + 1, device=ref.device, dtype=ref.dtype)
+    z_pow = z12_t ** n  # (L+1,)
 
-    real_part = x12_t
-    imag_part = y12_t
+    # z_factor[n1] = fn * sum_{n2} Z[n1,n2] * z^n2, with GPUMD parity/limit rule
+    Z = _get_Z_coeff(L, ref)          # (L+1, L+1)
+    M = _get_Z_mask(L, ref)           # (L+1, L+1)
+    z_factor = (Z * M) @ z_pow        # (L+1,)
+    z_factor = z_factor * fn_t        # (L+1,)
 
-    Z_COEFF = Z_COEFFICIENTS[L].to(device=ref.device, dtype=ref.dtype)
+    # (x + i y)^m, m=1..L (use complex autograd, then take real/imag)
+    if L >= 1:
+        c = torch.complex(x12_t, y12_t)
+        k = torch.arange(1, L + 1, device=ref.device, dtype=torch.int64)
+        c_pow = c ** k  # (L,)
+        real_part = c_pow.real.to(dtype=ref.dtype)
+        imag_part = c_pow.imag.to(dtype=ref.dtype)
 
-    for n1 in range(L + 1):
-        n2_start = 0 if (L + n1) % 2 == 0 else 1
-        z_factor = torch.zeros((), device=ref.device, dtype=ref.dtype)
-        for n2 in range(n2_start, L - n1 + 1, 2):
-            z_factor = z_factor + Z_COEFF[n1, n2] * z_pow[n2]
-        z_factor = z_factor * fn_t
+    # fill (2L+1) components into s: [m=0, m=1(cos), m=1(sin), ...]
+    vals = torch.empty((2 * L + 1,), device=ref.device, dtype=ref.dtype)
+    vals[0] = z_factor[0]
+    if L >= 1:
+        vals[1::2] = z_factor[1:] * real_part
+        vals[2::2] = z_factor[1:] * imag_part
 
-        if n1 == 0:
-            s[s_index] = s[s_index] + z_factor
-            s_index += 1
-        else:
-            s[s_index] = s[s_index] + z_factor * real_part
-            s_index += 1
-            s[s_index] = s[s_index] + z_factor * imag_part
-            s_index += 1
-            real_part, imag_part = complex_product(x12_t, y12_t, real_part, imag_part, ref)
+    s[s_index : s_index + 2 * L + 1] = s[s_index : s_index + 2 * L + 1] + vals
 
 
 def accumulate_s(L_max: int, d12: TensorLike, x12: TensorLike, y12: TensorLike, z12: TensorLike, fn: TensorLike, s: torch.Tensor) -> None:
@@ -212,15 +237,22 @@ def accumulate_s(L_max: int, d12: TensorLike, x12: TensorLike, y12: TensorLike, 
 def find_q_one(L: int, s: torch.Tensor, c3b: torch.Tensor) -> torch.Tensor:
     """
     Compute invariant q for a given L (GPUMD find_q_one).
+
+    Vectorized to avoid Python loops and repeated dtype/device casts.
     """
     start_index = L * L - 1
     num_terms = 2 * L + 1
 
-    q = torch.zeros((), device=s.device, dtype=s.dtype)
-    for k in range(1, num_terms):
-        q = q + c3b[start_index + k].to(dtype=s.dtype, device=s.device) * s[start_index + k] * s[start_index + k]
-    q = q * 2.0
-    q = q + c3b[start_index].to(dtype=s.dtype, device=s.device) * s[start_index] * s[start_index]
+    # Ensure coefficient table is on the same device/dtype (cheap if already aligned)
+    c = c3b.to(device=s.device, dtype=s.dtype)
+
+    ss = s[start_index : start_index + num_terms]
+    cc = c[start_index : start_index + num_terms]
+
+    # q = c0*s0^2 + 2*sum_{k=1}^{2L} ck*sk^2
+    q = cc[0] * ss[0] * ss[0]
+    if num_terms > 1:
+        q = q + 2.0 * torch.sum(cc[1:] * (ss[1:] * ss[1:]))
     return q
 
 
@@ -265,6 +297,175 @@ def find_q(
         )
         q[(L_max + 1) * n_max_angular_plus_1 + n] = q_5b
 
+
+def accumulate_s_edges_batched(
+    L_max: int,
+    rij: torch.Tensor,
+    fn: torch.Tensor,
+    edge_i: torch.Tensor,
+    n_atoms: int,
+) -> torch.Tensor:
+    """
+    Batched accumulate_s over an *edge list*.
+
+    Parameters
+    ----------
+    L_max : int
+        Maximum angular momentum (same as in GPUMD; typical <= 8).
+    rij : torch.Tensor
+        Edge vectors in Cartesian coordinates, shape (E, 3).
+        Must be built from torch positions to preserve gradients w.r.t. positions.
+    fn : torch.Tensor
+        Radial prefactors per edge and per angular n-channel, shape (E, n_max_angular_plus_1).
+        This is typically gn12 for each edge (i,j) and channel n.
+    edge_i : torch.Tensor
+        Center indices for each edge, shape (E,) long. Contributions are accumulated to these atoms.
+    n_atoms : int
+        Number of atoms N.
+
+    Returns
+    -------
+    s : torch.Tensor
+        Accumulated real spherical-harmonics components, shape (N, n_max_angular_plus_1, NUM_OF_ABC).
+        Layout of the last dimension follows the GPUMD packing (start=L^2-1, length=2L+1).
+    """
+    if rij.numel() == 0:
+        return torch.zeros((n_atoms, int(fn.shape[1]), NUM_OF_ABC), device=rij.device, dtype=rij.dtype)
+
+    ref = rij
+    E = int(rij.shape[0])
+    n_chan = int(fn.shape[1])
+
+    # distances and normalized directions
+    d = torch.linalg.norm(rij, dim=1)  # (E,)
+    d_inv = 1.0 / d
+    x = rij[:, 0] * d_inv
+    y = rij[:, 1] * d_inv
+    z = rij[:, 2] * d_inv
+
+    s_out = torch.zeros((n_atoms, n_chan, NUM_OF_ABC), device=ref.device, dtype=ref.dtype)
+
+    # Loop over L only (small); vectorize over edges and n-channels.
+    for L in range(1, L_max + 1):
+        start = L * L - 1
+        width = 2 * L + 1
+
+        # z^n, n=0..L, for all edges
+        n = torch.arange(0, L + 1, device=ref.device, dtype=ref.dtype)  # (L+1,)
+        z_pow = z[:, None] ** n[None, :]  # (E, L+1)
+
+        Z = _get_Z_coeff(L, ref)  # (L+1, L+1)
+        M = _get_Z_mask(L, ref)   # (L+1, L+1)
+        ZM = (Z * M)              # (L+1, L+1)
+
+        # z_factor_base[e, n1] = sum_{n2} ZM[n1,n2] * z_pow[e,n2]
+        z_factor_base = z_pow @ ZM.T  # (E, L+1)
+
+        # (x + i y)^m, m=1..L
+        if L >= 1:
+            c = torch.complex(x, y)  # (E,)
+            k = torch.arange(1, L + 1, device=ref.device, dtype=torch.int64)  # (L,)
+            c_pow = c[:, None] ** k[None, :]  # (E, L)
+            real_part = c_pow.real.to(dtype=ref.dtype)
+            imag_part = c_pow.imag.to(dtype=ref.dtype)
+
+        # base_block is the (2L+1) components for fn=1.0
+        base_block = torch.empty((E, width), device=ref.device, dtype=ref.dtype)
+        base_block[:, 0] = z_factor_base[:, 0]
+        if L >= 1:
+            base_block[:, 1::2] = z_factor_base[:, 1:] * real_part
+            base_block[:, 2::2] = z_factor_base[:, 1:] * imag_part
+
+        # Multiply by fn for all channels and scatter-add to centers
+        vals = fn[:, :, None] * base_block[:, None, :]  # (E, n_chan, width)
+        vals2d = vals.reshape(E, n_chan * width)
+
+        tmp = torch.zeros((n_atoms, n_chan * width), device=ref.device, dtype=ref.dtype)
+        tmp.index_add_(0, edge_i, vals2d)
+
+        s_out[:, :, start : start + width] += tmp.reshape(n_atoms, n_chan, width)
+
+    return s_out
+
+
+def find_q_batched(
+    L_max: int,
+    num_L: int,
+    s: torch.Tensor,
+    c3b: torch.Tensor,
+    c4b: torch.Tensor,
+    c5b: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Batched GPUMD find_q.
+
+    Parameters
+    ----------
+    s : torch.Tensor
+        Accumulated s, shape (N, n_chan, NUM_OF_ABC).
+
+    Returns
+    -------
+    q : torch.Tensor
+        Angular invariants, shape (N, num_L, n_chan).
+        Flattening with q.reshape(N, -1) matches GPUMD indexing:
+            q[(L-1)*n_chan + n] for 3-body channels.
+    """
+    N = int(s.shape[0])
+    n_chan = int(s.shape[1])
+    device = s.device
+    dtype = s.dtype
+
+    q = torch.zeros((N, num_L, n_chan), device=device, dtype=dtype)
+
+    c3 = c3b.to(device=device, dtype=dtype)
+
+    # 3-body: L=1..min(L_max, 8)
+    for L in range(1, min(L_max + 1, 9)):
+        start = L * L - 1
+        width = 2 * L + 1
+
+        ss = s[:, :, start : start + width]  # (N, n_chan, width)
+        w = c3[start : start + width]        # (width,)
+        if width > 1:
+            w = w.clone()
+            w[1:] = w[1:] * 2.0
+
+        q[:, L - 1, :] = torch.sum((ss * ss) * w.view(1, 1, -1), dim=-1)
+
+    # 4-body term (when num_L >= L_max+1)
+    if num_L >= L_max + 1:
+        c4 = c4b.to(device=device, dtype=dtype)
+        s3 = s[:, :, 3]
+        s4 = s[:, :, 4]
+        s5 = s[:, :, 5]
+        s6 = s[:, :, 6]
+        s7 = s[:, :, 7]
+        q4 = (
+            c4[0] * s3 * s3 * s3 +
+            c4[1] * s3 * (s4 * s4 + s5 * s5) +
+            c4[2] * s3 * (s6 * s6 + s7 * s7) +
+            c4[3] * s6 * (s5 * s5 - s4 * s4) +
+            c4[4] * s4 * s5 * s7
+        )
+        q[:, L_max, :] = q4
+
+    # 5-body term (when num_L >= L_max+2)
+    if num_L >= L_max + 2:
+        c5 = c5b.to(device=device, dtype=dtype)
+        s0 = s[:, :, 0]
+        s1 = s[:, :, 1]
+        s2 = s[:, :, 2]
+        s0_sq = s0 * s0
+        s1_sq_plus_s2_sq = s1 * s1 + s2 * s2
+        q5 = (
+            c5[0] * s0_sq * s0_sq +
+            c5[1] * s0_sq * s1_sq_plus_s2_sq +
+            c5[2] * s1_sq_plus_s2_sq * s1_sq_plus_s2_sq
+        )
+        q[:, L_max + 1, :] = q5
+
+    return q
 
 class SphericalHarmonicsNEP(nn.Module):
     """
